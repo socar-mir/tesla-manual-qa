@@ -1,4 +1,5 @@
 import os
+import pickle
 import anthropic
 import pdfplumber
 import streamlit as st
@@ -6,6 +7,8 @@ import streamlit as st
 # ─── 설정 ────────────────────────────────────────────────────
 
 DATA_DIR = "."
+CACHE_DIR = "cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 MANUALS = {
     "Model X": f"{DATA_DIR}/modelX.pdf",
@@ -22,28 +25,53 @@ SYSTEM_PROMPT = """당신은 테슬라 고객센터 상담원을 지원하는 AI
 4. 매뉴얼에 해당 정보가 정말 없는 경우에만 "이 매뉴얼에서 관련 정보를 찾을 수 없습니다"라고 안내하세요.
 5. 답변은 상담원이 고객에게 바로 전달할 수 있는 자연스러운 한국어로 작성하세요."""
 
-# ─── 매뉴얼 로딩 ─────────────────────────────────────────────
+# ─── 매뉴얼 로딩: 디스크 캐시 우선 ───────────────────────────
 
 
-@st.cache_resource(show_spinner="📖 매뉴얼 로딩 중... (최초 1회)")
-def load_all_manuals():
-    """앱 시작 시 모든 매뉴얼 PDF 텍스트를 한 번만 로드"""
-    texts = {}
-    for model_name, pdf_path in MANUALS.items():
-        if not os.path.exists(pdf_path):
-            texts[model_name] = None
-            continue
+def _cache_path(model_name: str) -> str:
+    return os.path.join(CACHE_DIR, f"{model_name.replace(' ', '_')}.pkl")
 
-        pages = []
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text and text.strip():
-                    pages.append(text)
 
-        texts[model_name] = "\n\n".join(pages)
+def cache_exists(model_name: str) -> bool:
+    return os.path.exists(_cache_path(model_name))
 
-    return texts
+
+@st.cache_resource(show_spinner=False)
+def load_manual(model_name: str) -> str | None:
+    """
+    로딩 순서:
+      1순위: cache/*.pkl  (즉시, <0.1초)
+      2순위: PDF 파싱 후 .pkl 저장 (최초 1회만 느림)
+    """
+    cache_file = _cache_path(model_name)
+
+    # 1순위: 디스크 캐시
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            os.remove(cache_file)  # 손상된 캐시 삭제 후 재파싱
+
+    # 2순위: PDF 파싱
+    pdf_path = MANUALS.get(model_name)
+    if not pdf_path or not os.path.exists(pdf_path):
+        return None
+
+    pages = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text and text.strip():
+                pages.append(text)
+
+    text = "\n\n".join(pages)
+
+    # 다음 시작을 위해 캐시 저장
+    with open(cache_file, "wb") as f:
+        pickle.dump(text, f)
+
+    return text
 
 
 # ─── AI 답변 ──────────────────────────────────────────────────
@@ -57,7 +85,6 @@ def get_api_key():
 
 
 def stream_answer(question: str, model_name: str, manual_text: str):
-    """매뉴얼 전체를 컨텍스트로 제공하고 스트리밍 답변 생성"""
     api_key = get_api_key()
     if not api_key:
         yield "❌ ANTHROPIC_API_KEY가 설정되지 않았습니다."
@@ -65,16 +92,12 @@ def stream_answer(question: str, model_name: str, manual_text: str):
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    # 매뉴얼 텍스트에 프롬프트 캐싱 적용 (두 번째 호출부터 비용 ~90% 절감)
     system = [
-        {
-            "type": "text",
-            "text": SYSTEM_PROMPT,
-        },
+        {"type": "text", "text": SYSTEM_PROMPT},
         {
             "type": "text",
             "text": f"[테슬라 {model_name} 오너스 매뉴얼 전문]\n\n{manual_text}",
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": {"type": "ephemeral"},  # Anthropic 서버 캐싱으로 비용 절감
         },
     ]
 
@@ -90,59 +113,62 @@ def stream_answer(question: str, model_name: str, manual_text: str):
 
 # ─── Streamlit UI ─────────────────────────────────────────────
 
-st.set_page_config(
-    page_title="테슬라 매뉴얼 AI",
-    page_icon="⚡",
-    layout="wide",
-)
+st.set_page_config(page_title="테슬라 매뉴얼 AI", page_icon="⚡", layout="wide")
 
 st.title("⚡ 테슬라 고객센터 AI 어시스턴트")
 st.caption("오너스 매뉴얼 전체를 AI가 직접 참조하여 답변합니다")
 
-# 앱 시작 시 두 모델 매뉴얼 모두 로드
-manual_texts = load_all_manuals()
-
 # ─── 사이드바 ─────────────────────────────────────────────────
+
 with st.sidebar:
     st.header("⚙️설정")
 
-    model_choice = st.radio(
-        "차량 모델 선택",
-        list(MANUALS.keys()),
-        index=0,
-    )
+    model_choice = st.radio("차량 모델 선택", list(MANUALS.keys()), index=0)
 
     st.divider()
-    st.subheader("📊 매뉴얼 로딩 상태")
+    st.subheader("📊 캐시 상태")
 
-    for name, text in manual_texts.items():
-        if text:
-            approx_tokens = len(text) // 3
-            st.success(f"✅ **{name}**: ~{approx_tokens:,} tokens")
+    for name in MANUALS:
+        if cache_exists(name):
+            st.success(f"✅ **{name}**: 즉시 로딩")
         else:
-            st.error(f"❌ **{name}**: PDF 파일 없음")
+            st.warning(f"⏳ **{name}**: 최초 로딩 필요 (~30-60초)")
 
     st.divider()
-    st.info(
-        "💡 **검색 방식**\n\n"
-        "매뉴얼 전체를 AI가 직접 읽고 답변합니다.\n"
-        "한국어 질문도 영어 매뉴얼에서 정확히 찾아드립니다."
-    )
+
+    if st.button("🗑️캐시 초기화", help="PDF 파일을 교체했을 때 클릭"):
+        for name in MANUALS:
+            p = _cache_path(name)
+            if os.path.exists(p):
+                os.remove(p)
+        load_manual.clear()
+        st.success("캐시 삭제 완료! 페이지를 새로고침하세요.")
+        st.rerun()
 
 # ─── 메인 영역 ────────────────────────────────────────────────
 
-current_manual = manual_texts.get(model_choice)
+# 최초 로딩 안내 (캐시 없을 때만 표시)
+if not cache_exists(model_choice):
+    st.info(
+        f"⏳ **{model_choice} 매뉴얼을 처음 로딩합니다.**  \n"
+        "약 30~60초 소요됩니다. 이후에는 즉시 로딩됩니다."
+    )
+
+with st.spinner(f"📖 {model_choice} 매뉴얼 로딩 중..."):
+    current_manual = load_manual(model_choice)
 
 if not current_manual:
     st.error(f"❌ {model_choice} 매뉴얼 PDF를 찾을 수 없습니다.")
     st.info("modelX.pdf, modelS.pdf 파일이 app.py와 같은 폴더에 있는지 확인하세요.")
     st.stop()
 
+# ─── 검색 ────────────────────────────────────────────────────
+
 st.subheader(f"💬 {model_choice} 문의 검색")
 
 question = st.text_input(
     "고객 문의 내용을 입력하세요",
-    placeholder="예: FSD는 어떻게 사용하나요? / 타이어 공기압 확인 방법 / 오토파일럿 설정",
+    placeholder="예: FSD는 어떻게 사용하나요? / 타이어 공기압 / 오토파일럿 설정",
     key="q",
 )
 
