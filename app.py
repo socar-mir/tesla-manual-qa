@@ -58,7 +58,6 @@ def extract_chunks(pdf_path, chunk_size=800):
 
 @st.cache_resource(show_spinner="매뉴얼 인덱스 구축 중... (최초 1회)")
 def load_all_indices():
-    """앱 시작 시 두 모델 인덱스를 모두 로드합니다."""
     indices = {}
     for model_name, pdf_path in MANUALS.items():
         index_path = f"{DB_DIR}/{model_name}.pkl"
@@ -74,7 +73,6 @@ def load_all_indices():
 
 
 def expand_query(question: str) -> list[str]:
-    """Claude Haiku로 한국어 질문을 영어 키워드로 확장합니다."""
     client = anthropic.Anthropic()
     resp = client.messages.create(
         model="claude-haiku-4-5",
@@ -95,7 +93,6 @@ def expand_query(question: str) -> list[str]:
 
 
 def search(question, model_name, top_k=15):
-    """쿼리 확장 후 BM25로 검색합니다. top_k를 크게 잡아 Claude에게 충분한 문맥 제공."""
     data = load_all_indices()[model_name]
     queries = expand_query(question)
 
@@ -122,7 +119,7 @@ def search(question, model_name, top_k=15):
     context = "\n\n".join(
         f"[페이지 {c['page']}]\n{c['text']}" for c in chunks
     )
-    return context, chunks
+    return context, chunks, queries  # queries 반환 추가
 
 
 def stream_answer(question, model_name, context):
@@ -149,8 +146,30 @@ def stream_answer(question, model_name, context):
 # ── UI ───────────────────────────────────────────────────────────
 st.set_page_config(page_title="테슬라 매뉴얼 검색", page_icon="⚡", layout="wide")
 st.title("⚡ 테슬라 고객센터 매뉴얼 검색")
-st.caption("고객 문의 내용을 입력하면 매뉴얼에서 관련 정보를 찾아드립니다.")
 
+# ── 사이드바: 진단 도구 ──────────────────────────────────────────
+with st.sidebar:
+    st.header("🔍 매뉴얼 진단")
+    if st.button("추출 상태 확인"):
+        indices = load_all_indices()
+        for name, data in indices.items():
+            chunks = data["chunks"]
+            st.markdown(f"**{name}**: {len(chunks)}개 청크")
+
+            if len(chunks) == 0:
+                st.error("❌ 텍스트 추출 실패 — PDF가 이미지 기반일 수 있습니다.")
+            elif len(chunks) < 50:
+                st.warning(f"⚠️청크 수가 너무 적습니다 ({len(chunks)}개)")
+            else:
+                st.success(f"✅ 정상 ({len(chunks)}개 청크)")
+
+            with st.expander(f"{name} 샘플 텍스트 (1~3번째 청크)"):
+                for c in chunks[:3]:
+                    st.markdown(f"**페이지 {c['page']}**")
+                    st.text(c["text"][:300])
+                    st.divider()
+
+# ── 메인 화면 ────────────────────────────────────────────────────
 load_all_indices()
 
 if "cache" not in st.session_state:
@@ -171,10 +190,10 @@ question = st.text_area(
 
 if st.button("🔍 검색", type="primary") and question.strip():
     with st.spinner("키워드 분석 및 매뉴얼 검색 중..."):
-        context, chunks = search(question, car_model)
+        context, chunks, queries = search(question, car_model)
 
     st.divider()
-    tab1, tab2 = st.tabs(["📋 안내 내용", "📄 매뉴얼 발췌"])
+    tab1, tab2, tab3 = st.tabs(["📋 안내 내용", "📄 매뉴얼 발췌", "🔍 검색 진단"])
 
     with tab1:
         cache_key = f"{question}_{car_model}"
@@ -185,6 +204,18 @@ if st.button("🔍 검색", type="primary") and question.strip():
             st.session_state.cache[cache_key] = answer
 
     with tab2:
+        if not chunks:
+            st.warning("검색된 내용이 없습니다.")
         for i, c in enumerate(chunks, 1):
             with st.expander(f"발췌 {i} — {c['page']}페이지 (점수: {c['score']})"):
                 st.text(c["text"])
+
+    with tab3:
+        st.markdown("#### 생성된 검색 키워드")
+        st.info(" / ".join(queries))
+
+        st.markdown("#### Claude에게 전달된 전체 문맥")
+        if context:
+            st.text_area("전달된 문맥", value=context, height=400)
+        else:
+            st.error("❌ 전달된 문맥이 없습니다. 매뉴얼에서 관련 내용을 찾지 못했습니다.")
