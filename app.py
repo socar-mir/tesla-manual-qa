@@ -15,6 +15,10 @@ MANUALS = {
     "Model S": f"{DATA_DIR}/modelS.pdf",
 }
 
+# 200K 토큰 컨텍스트 창 안전 한계
+# 영문 기준 ~4자/토큰 → 720,000자 ≈ 180K 토큰 (20K는 시스템+질문+답변 여유)
+MAX_MANUAL_CHARS = 720_000
+
 SYSTEM_PROMPT = """당신은 테슬라 고객센터 상담원을 지원하는 AI 어시스턴트입니다.
 제공된 테슬라 오너스 매뉴얼을 참고하여 고객 문의에 정확히 답변하세요.
 
@@ -37,7 +41,7 @@ def cache_exists(model_name: str) -> bool:
 
 
 @st.cache_resource(show_spinner=False)
-def load_manual(model_name: str) -> str | None:
+def load_manual(model_name: str):
     """
     로딩 순서:
       1순위: cache/*.pkl  (즉시, <0.1초)
@@ -92,23 +96,37 @@ def stream_answer(question: str, model_name: str, manual_text: str):
 
     client = anthropic.Anthropic(api_key=api_key)
 
+    # 컨텍스트 창 초과 방지
+    if len(manual_text) > MAX_MANUAL_CHARS:
+        manual_text = manual_text[:MAX_MANUAL_CHARS]
+        truncated = True
+    else:
+        truncated = False
+
     system = [
         {"type": "text", "text": SYSTEM_PROMPT},
         {
             "type": "text",
-            "text": f"[테슬라 {model_name} 오너스 매뉴얼 전문]\n\n{manual_text}",
-            "cache_control": {"type": "ephemeral"},  # Anthropic 서버 캐싱으로 비용 절감
+            "text": f"[테슬라 {model_name} 오너스 매뉴얼]\n\n{manual_text}",
+            "cache_control": {"type": "ephemeral"},
         },
     ]
 
-    with client.messages.stream(
-        model="claude-opus-4-6",
-        max_tokens=2048,
-        system=system,
-        messages=[{"role": "user", "content": question}],
-    ) as stream:
-        for text in stream.text_stream:
-            yield text
+    try:
+        with client.messages.stream(
+            model="claude-opus-4-6",
+            max_tokens=2048,
+            system=system,
+            messages=[{"role": "user", "content": question}],
+        ) as stream:
+            if truncated:
+                yield "⚠️*매뉴얼이 커서 앞부분(약 180K 토큰)만 참조합니다.*\n\n"
+            for text in stream.text_stream:
+                yield text
+    except anthropic.BadRequestError as e:
+        yield f"❌ API 요청 오류입니다. 잠시 후 다시 시도해주세요.\n\n`{e.message}`"
+    except Exception as e:
+        yield f"❌ 오류: {str(e)}"
 
 
 # ─── Streamlit UI ─────────────────────────────────────────────
@@ -161,6 +179,12 @@ if not current_manual:
     st.error(f"❌ {model_choice} 매뉴얼 PDF를 찾을 수 없습니다.")
     st.info("modelX.pdf, modelS.pdf 파일이 app.py와 같은 폴더에 있는지 확인하세요.")
     st.stop()
+
+# 로딩된 매뉴얼 크기 표시
+chars = len(current_manual)
+approx_tokens = chars // 4
+if chars > MAX_MANUAL_CHARS:
+    st.warning(f"⚠️매뉴얼이 큽니다 (~{approx_tokens:,} 토큰). 앞부분 180K 토큰만 참조합니다.")
 
 # ─── 검색 ────────────────────────────────────────────────────
 
