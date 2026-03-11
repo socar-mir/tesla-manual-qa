@@ -1,4 +1,3 @@
 anthropic
 pdfplumber
-rank_bm25
 streamlit
