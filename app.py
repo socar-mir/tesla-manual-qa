@@ -1,17 +1,14 @@
-import sys
-import pysqlite3
-sys.modules["sqlite3"] = pysqlite3
-
 import re
 import os
 import pickle
+import numpy as np
 import pdfplumber
 import anthropic
-from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
 import streamlit as st
 
 DATA_DIR = "."
-DB_DIR = "bm25_index"
+DB_DIR = "vector_index"
 os.makedirs(DB_DIR, exist_ok=True)
 
 MANUALS = {
@@ -36,10 +33,6 @@ SYSTEM_PROMPT = """당신은 테슬라 고객센터 상담원을 지원하는 AI
 매뉴얼에 없으면 해당 정보를 찾을 수 없다고 하세요."""
 
 
-def tokenize(text):
-    return re.findall(r"\w+", text.lower())
-
-
 def extract_chunks(pdf_path, chunk_size=800):
     chunks = []
     with pdfplumber.open(pdf_path) as pdf:
@@ -60,89 +53,63 @@ def extract_chunks(pdf_path, chunk_size=800):
     return [c for c in chunks if len(c["text"]) > 50]
 
 
-@st.cache_resource
-def load_index(model_name):
-    index_path = f"{DB_DIR}/{model_name}.pkl"
-    if not os.path.exists(index_path):
-        pdf_path = MANUALS[model_name]
-        chunks = extract_chunks(pdf_path)
-        tokenized = [tokenize(c["text"]) for c in chunks]
-        bm25 = BM25Okapi(tokenized)
-        with open(index_path, "wb") as f:
-            pickle.dump({"bm25": bm25, "chunks": chunks}, f)
-    with open(index_path, "rb") as f:
-        return pickle.load(f)
+@st.cache_resource(show_spinner="임베딩 모델 로딩 중...")
+def load_embed_model():
+    return SentenceTransformer("paraphrase-multilingual-MiniLM-L6-v2")
 
 
-def expand_query(question: str) -> list[str]:
-    """API 호출 없이 정적 사전으로 키워드 확장합니다."""
-    term_map = {
-        "FSD": "Full Self-Driving Autopilot",
-        "오토파일럿": "Autopilot Traffic-Aware Cruise Control",
-        "크루즈": "cruise control TACC",
-        "충전": "charging charge Supercharger",
-        "배터리": "battery range energy",
-        "업데이트": "software update OTA",
-        "에어컨": "air conditioning climate HVAC",
-        "히터": "heater heating climate",
-        "브레이크": "brake braking regenerative",
-        "내비": "navigation map route",
-        "주차": "parking Park Autopark",
-        "카메라": "camera Autopilot vision",
-        "센트리": "Sentry Mode security",
-        "도그모드": "Dog Mode cabin overheat",
-        "발렛": "Valet Mode speed limit",
-        "앱": "mobile app phone key",
-        "블루투스": "Bluetooth phone key",
-        "와이파이": "Wi-Fi wireless network",
-        "트렁크": "trunk cargo liftgate",
-        "시트": "seat seating adjustment",
-        "핸들": "steering wheel",
-        "미러": "mirror side rear",
-        "창문": "window glass sunroof",
-        "와이퍼": "wiper windshield",
-        "전조등": "headlight light lamp",
-    }
-    queries = [question]
-    for kr, en in term_map.items():
-        if kr in question:
-            queries.append(en)
-    return queries
+@st.cache_resource(show_spinner="매뉴얼 인덱스 구축 중... (최초 1회, 약 1분 소요)")
+def load_all_indices():
+    """앱 시작 시 모든 모델 인덱스를 한 번에 로드합니다."""
+    embed_model = load_embed_model()
+    indices = {}
+
+    for model_name, pdf_path in MANUALS.items():
+        index_path = f"{DB_DIR}/{model_name}.pkl"
+
+        if not os.path.exists(index_path):
+            chunks = extract_chunks(pdf_path)
+            texts = [c["text"] for c in chunks]
+            embeddings = embed_model.encode(
+                texts,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+                batch_size=64,
+            )
+            with open(index_path, "wb") as f:
+                pickle.dump({"embeddings": embeddings, "chunks": chunks}, f)
+
+        with open(index_path, "rb") as f:
+            indices[model_name] = pickle.load(f)
+
+    return indices
 
 
 def search(question, model_name, top_k=5):
-    data = load_index(model_name)
-    queries = expand_query(question)
+    indices = load_all_indices()
+    embed_model = load_embed_model()
+    data = indices[model_name]
 
-    seen_pages = set()
-    all_chunks = []
+    query_emb = embed_model.encode([question], normalize_embeddings=True)
+    scores = np.dot(data["embeddings"], query_emb.T).squeeze()
+    top_i = scores.argsort()[::-1][:top_k]
 
-    for query in queries:
-        scores = data["bm25"].get_scores(tokenize(query))
-        top_i = scores.argsort()[::-1][:3]
-        for i in top_i:
-            page = data["chunks"][i]["page"]
-            if scores[i] > 0 and page not in seen_pages:
-                seen_pages.add(page)
-                all_chunks.append(
-                    {
-                        "text": data["chunks"][i]["text"],
-                        "page": page,
-                        "score": round(float(scores[i]), 2),
-                    }
-                )
-
-    all_chunks.sort(key=lambda x: x["score"], reverse=True)
-    chunks = all_chunks[:top_k]
+    chunks = [
+        {
+            "text": data["chunks"][i]["text"],
+            "page": data["chunks"][i]["page"],
+            "score": round(float(scores[i]), 3),
+        }
+        for i in top_i
+    ]
 
     context = "\n\n".join(
-        f"[페이지 {c['page']} | 점수 {c['score']}]\n{c['text']}" for c in chunks
+        f"[페이지 {c['page']} | 유사도 {c['score']}]\n{c['text']}" for c in chunks
     )
     return context, chunks
 
 
-def stream_answer(question: str, model_name: str, context: str):
-    """처음 질문은 스트리밍으로 표시합니다."""
+def stream_answer(question, model_name, context):
     client = anthropic.Anthropic()
     car = "Model X" if model_name == "model_x" else "Model S"
     with client.messages.stream(
@@ -165,6 +132,9 @@ st.set_page_config(page_title="테슬라 매뉴얼 검색", page_icon="⚡", lay
 st.title("⚡ 테슬라 고객센터 매뉴얼 검색")
 st.caption("고객 문의 내용을 입력하면 매뉴얼에서 관련 정보를 찾아드립니다.")
 
+# 앱 시작 시 두 인덱스 모두 미리 로드
+load_all_indices()
+
 if "cache" not in st.session_state:
     st.session_state.cache = {}
 
@@ -178,7 +148,7 @@ car_model = st.radio(
 question = st.text_area(
     "고객 문의 내용",
     height=100,
-    placeholder="예: FSD 사용 방법을 알려주세요.",
+    placeholder="예: FSD 켜는 방법을 알려주세요.",
 )
 
 if st.button("🔍 검색", type="primary") and question.strip():
@@ -191,10 +161,8 @@ if st.button("🔍 검색", type="primary") and question.strip():
     with tab1:
         cache_key = f"{question}_{car_model}"
         if cache_key in st.session_state.cache:
-            # 동일 질문 → 캐시에서 즉시 표시
             st.markdown(st.session_state.cache[cache_key])
         else:
-            # 새 질문 → 스트리밍으로 표시
             answer = st.write_stream(
                 stream_answer(question, car_model, context)
             )
@@ -202,5 +170,5 @@ if st.button("🔍 검색", type="primary") and question.strip():
 
     with tab2:
         for i, c in enumerate(chunks, 1):
-            with st.expander(f"발췌 {i} — {c['page']}페이지 (점수: {c['score']})"):
+            with st.expander(f"발췌 {i} — {c['page']}페이지 (유사도: {c['score']})"):
                 st.text(c["text"])
