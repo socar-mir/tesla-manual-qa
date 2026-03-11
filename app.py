@@ -1,14 +1,13 @@
 import re
 import os
 import pickle
-import numpy as np
-import pdfplumber
 import anthropic
-from sentence_transformers import SentenceTransformer
+import pdfplumber
+from rank_bm25 import BM25Okapi
 import streamlit as st
 
 DATA_DIR = "."
-DB_DIR = "vector_index"
+DB_DIR = "bm25_index"
 os.makedirs(DB_DIR, exist_ok=True)
 
 MANUALS = {
@@ -33,6 +32,10 @@ SYSTEM_PROMPT = """당신은 테슬라 고객센터 상담원을 지원하는 AI
 매뉴얼에 없으면 해당 정보를 찾을 수 없다고 하세요."""
 
 
+def tokenize(text):
+    return re.findall(r"\w+", text.lower())
+
+
 def extract_chunks(pdf_path, chunk_size=800):
     chunks = []
     with pdfplumber.open(pdf_path) as pdf:
@@ -53,58 +56,71 @@ def extract_chunks(pdf_path, chunk_size=800):
     return [c for c in chunks if len(c["text"]) > 50]
 
 
-@st.cache_resource(show_spinner="임베딩 모델 로딩 중...")
-def load_embed_model():
-    return SentenceTransformer("paraphrase-multilingual-MiniLM-L6-v2")
-
-
-@st.cache_resource(show_spinner="매뉴얼 인덱스 구축 중... (최초 1회, 약 1분 소요)")
+@st.cache_resource(show_spinner="매뉴얼 인덱스 구축 중... (최초 1회)")
 def load_all_indices():
-    """앱 시작 시 모든 모델 인덱스를 한 번에 로드합니다."""
-    embed_model = load_embed_model()
+    """앱 시작 시 두 모델 인덱스를 모두 로드합니다."""
     indices = {}
-
     for model_name, pdf_path in MANUALS.items():
         index_path = f"{DB_DIR}/{model_name}.pkl"
-
         if not os.path.exists(index_path):
             chunks = extract_chunks(pdf_path)
-            texts = [c["text"] for c in chunks]
-            embeddings = embed_model.encode(
-                texts,
-                show_progress_bar=False,
-                normalize_embeddings=True,
-                batch_size=64,
-            )
+            tokenized = [tokenize(c["text"]) for c in chunks]
+            bm25 = BM25Okapi(tokenized)
             with open(index_path, "wb") as f:
-                pickle.dump({"embeddings": embeddings, "chunks": chunks}, f)
-
+                pickle.dump({"bm25": bm25, "chunks": chunks}, f)
         with open(index_path, "rb") as f:
             indices[model_name] = pickle.load(f)
-
     return indices
 
 
-def search(question, model_name, top_k=5):
-    indices = load_all_indices()
-    embed_model = load_embed_model()
-    data = indices[model_name]
+def expand_query(question: str) -> list[str]:
+    """Claude Haiku로 한국어 질문을 영어 키워드로 확장합니다."""
+    client = anthropic.Anthropic()
+    resp = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=120,
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"Tesla 차량 매뉴얼에서 검색할 영어 키워드 6개를 생성하세요.\n"
+                    f"키워드만 쉼표로 구분해서 출력하세요. 설명 없이 키워드만.\n\n"
+                    f"질문: {question}\n영어 키워드:"
+                ),
+            }
+        ],
+    )
+    keywords = [k.strip() for k in resp.content[0].text.strip().split(",") if k.strip()]
+    return [question] + keywords
 
-    query_emb = embed_model.encode([question], normalize_embeddings=True)
-    scores = np.dot(data["embeddings"], query_emb.T).squeeze()
-    top_i = scores.argsort()[::-1][:top_k]
 
-    chunks = [
-        {
-            "text": data["chunks"][i]["text"],
-            "page": data["chunks"][i]["page"],
-            "score": round(float(scores[i]), 3),
-        }
-        for i in top_i
-    ]
+def search(question, model_name, top_k=15):
+    """쿼리 확장 후 BM25로 검색합니다. top_k를 크게 잡아 Claude에게 충분한 문맥 제공."""
+    data = load_all_indices()[model_name]
+    queries = expand_query(question)
 
+    seen_pages = set()
+    all_chunks = []
+
+    for query in queries:
+        scores = data["bm25"].get_scores(tokenize(query))
+        top_i = scores.argsort()[::-1][:5]
+        for i in top_i:
+            page = data["chunks"][i]["page"]
+            if scores[i] > 0 and page not in seen_pages:
+                seen_pages.add(page)
+                all_chunks.append(
+                    {
+                        "text": data["chunks"][i]["text"],
+                        "page": page,
+                        "score": round(float(scores[i]), 2),
+                    }
+                )
+
+    all_chunks.sort(key=lambda x: x["score"], reverse=True)
+    chunks = all_chunks[:top_k]
     context = "\n\n".join(
-        f"[페이지 {c['page']} | 유사도 {c['score']}]\n{c['text']}" for c in chunks
+        f"[페이지 {c['page']}]\n{c['text']}" for c in chunks
     )
     return context, chunks
 
@@ -119,7 +135,10 @@ def stream_answer(question, model_name, context):
         messages=[
             {
                 "role": "user",
-                "content": f"Tesla {car} 매뉴얼:\n\n{context}\n\n---\n\n고객 문의: {question}",
+                "content": (
+                    f"Tesla {car} 매뉴얼에서 찾은 관련 내용입니다:\n\n{context}\n\n"
+                    f"---\n\n고객 문의: {question}"
+                ),
             }
         ],
     ) as s:
@@ -132,7 +151,6 @@ st.set_page_config(page_title="테슬라 매뉴얼 검색", page_icon="⚡", lay
 st.title("⚡ 테슬라 고객센터 매뉴얼 검색")
 st.caption("고객 문의 내용을 입력하면 매뉴얼에서 관련 정보를 찾아드립니다.")
 
-# 앱 시작 시 두 인덱스 모두 미리 로드
 load_all_indices()
 
 if "cache" not in st.session_state:
@@ -152,7 +170,7 @@ question = st.text_area(
 )
 
 if st.button("🔍 검색", type="primary") and question.strip():
-    with st.spinner("매뉴얼 검색 중..."):
+    with st.spinner("키워드 분석 및 매뉴얼 검색 중..."):
         context, chunks = search(question, car_model)
 
     st.divider()
@@ -163,12 +181,10 @@ if st.button("🔍 검색", type="primary") and question.strip():
         if cache_key in st.session_state.cache:
             st.markdown(st.session_state.cache[cache_key])
         else:
-            answer = st.write_stream(
-                stream_answer(question, car_model, context)
-            )
+            answer = st.write_stream(stream_answer(question, car_model, context))
             st.session_state.cache[cache_key] = answer
 
     with tab2:
         for i, c in enumerate(chunks, 1):
-            with st.expander(f"발췌 {i} — {c['page']}페이지 (유사도: {c['score']})"):
+            with st.expander(f"발췌 {i} — {c['page']}페이지 (점수: {c['score']})"):
                 st.text(c["text"])
