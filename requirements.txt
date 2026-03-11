@@ -1,4 +1,4 @@
 anthropic
 pdfplumber
-sentence-transformers
+rank_bm25
 streamlit
