@@ -73,33 +73,50 @@ def load_index(model_name):
     with open(index_path, "rb") as f:
         return pickle.load(f)
 
+
 def expand_query(question: str) -> list[str]:
-    """한국어 질문을 영어 키워드로 확장합니다."""
-    client = anthropic.Anthropic()
-    resp = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=150,
-        messages=[
-            {
-                "role": "user",
-                "content": f"""테슬라 차량 매뉴얼에서 아래 질문과 관련된 내용을 찾을 영어 키워드 5개를 생성하세요.
-키워드만 쉼표로 구분해서 출력하세요. 설명 없이 키워드만.
-질문: {question}
-영어 키워드:""",
-            }
-        ],
-    )
-    raw = resp.content[0].text.strip()
-    keywords = [k.strip() for k in raw.split(",") if k.strip()]
-    return [question] + keywords
+    """API 호출 없이 정적 사전으로 키워드 확장합니다."""
+    term_map = {
+        "FSD": "Full Self-Driving Autopilot",
+        "오토파일럿": "Autopilot Traffic-Aware Cruise Control",
+        "크루즈": "cruise control TACC",
+        "충전": "charging charge Supercharger",
+        "배터리": "battery range energy",
+        "업데이트": "software update OTA",
+        "에어컨": "air conditioning climate HVAC",
+        "히터": "heater heating climate",
+        "브레이크": "brake braking regenerative",
+        "내비": "navigation map route",
+        "주차": "parking Park Autopark",
+        "카메라": "camera Autopilot vision",
+        "센트리": "Sentry Mode security",
+        "도그모드": "Dog Mode cabin overheat",
+        "발렛": "Valet Mode speed limit",
+        "앱": "mobile app phone key",
+        "블루투스": "Bluetooth phone key",
+        "와이파이": "Wi-Fi wireless network",
+        "트렁크": "trunk cargo liftgate",
+        "시트": "seat seating adjustment",
+        "핸들": "steering wheel",
+        "미러": "mirror side rear",
+        "창문": "window glass sunroof",
+        "와이퍼": "wiper windshield",
+        "전조등": "headlight light lamp",
+    }
+    queries = [question]
+    for kr, en in term_map.items():
+        if kr in question:
+            queries.append(en)
+    return queries
 
 
 def search(question, model_name, top_k=5):
     data = load_index(model_name)
-    # 쿼리 확장 (한국어 + 영어 키워드)
     queries = expand_query(question)
+
     seen_pages = set()
     all_chunks = []
+
     for query in queries:
         scores = data["bm25"].get_scores(tokenize(query))
         top_i = scores.argsort()[::-1][:3]
@@ -114,20 +131,23 @@ def search(question, model_name, top_k=5):
                         "score": round(float(scores[i]), 2),
                     }
                 )
+
     all_chunks.sort(key=lambda x: x["score"], reverse=True)
     chunks = all_chunks[:top_k]
+
     context = "\n\n".join(
         f"[페이지 {c['page']} | 점수 {c['score']}]\n{c['text']}" for c in chunks
     )
     return context, chunks
 
 
-def get_answer(question, model_name, context):
+def stream_answer(question: str, model_name: str, context: str):
+    """처음 질문은 스트리밍으로 표시합니다."""
     client = anthropic.Anthropic()
     car = "Model X" if model_name == "model_x" else "Model S"
-    resp = client.messages.create(
+    with client.messages.stream(
         model="claude-opus-4-6",
-        max_tokens=2048,
+        max_tokens=1024,
         system=SYSTEM_PROMPT,
         messages=[
             {
@@ -135,13 +155,18 @@ def get_answer(question, model_name, context):
                 "content": f"Tesla {car} 매뉴얼:\n\n{context}\n\n---\n\n고객 문의: {question}",
             }
         ],
-    )
-    return resp.content[0].text
+    ) as s:
+        for text in s.text_stream:
+            yield text
 
 
+# ── UI ───────────────────────────────────────────────────────────
 st.set_page_config(page_title="테슬라 매뉴얼 검색", page_icon="⚡", layout="wide")
 st.title("⚡ 테슬라 고객센터 매뉴얼 검색")
 st.caption("고객 문의 내용을 입력하면 매뉴얼에서 관련 정보를 찾아드립니다.")
+
+if "cache" not in st.session_state:
+    st.session_state.cache = {}
 
 car_model = st.radio(
     "차량 모델",
@@ -153,20 +178,28 @@ car_model = st.radio(
 question = st.text_area(
     "고객 문의 내용",
     height=100,
-    placeholder="예: 오토파일럿 활성화 방법을 알려주세요.",
+    placeholder="예: FSD 사용 방법을 알려주세요.",
 )
 
 if st.button("🔍 검색", type="primary") and question.strip():
     with st.spinner("매뉴얼 검색 중..."):
         context, chunks = search(question, car_model)
-    with st.spinner("AI 답변 생성 중..."):
-        answer = get_answer(question, car_model, context)
 
     st.divider()
     tab1, tab2 = st.tabs(["📋 안내 내용", "📄 매뉴얼 발췌"])
 
     with tab1:
-        st.markdown(answer)
+        cache_key = f"{question}_{car_model}"
+        if cache_key in st.session_state.cache:
+            # 동일 질문 → 캐시에서 즉시 표시
+            st.markdown(st.session_state.cache[cache_key])
+        else:
+            # 새 질문 → 스트리밍으로 표시
+            answer = st.write_stream(
+                stream_answer(question, car_model, context)
+            )
+            st.session_state.cache[cache_key] = answer
+
     with tab2:
         for i, c in enumerate(chunks, 1):
             with st.expander(f"발췌 {i} — {c['page']}페이지 (점수: {c['score']})"):
