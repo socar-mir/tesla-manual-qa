@@ -1,5 +1,4 @@
 anthropic
 pdfplumber
-rank_bm25
-pysqlite3-binary
+sentence-transformers
 streamlit
