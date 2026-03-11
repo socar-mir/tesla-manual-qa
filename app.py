@@ -130,7 +130,7 @@ def stream_answer(question: str, model_name: str, manual_text: str):
 
     try:
         with client.messages.stream(
-            model="claude-opus-4-6",
+            model="claude-sonnet-4-6",
             max_tokens=2048,
             system=system,
             messages=[{"role": "user", "content": question}],
