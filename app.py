@@ -1,3 +1,4 @@
+import re
 import os
 import pickle
 import anthropic
@@ -15,9 +16,10 @@ MANUALS = {
     "Model S": f"{DATA_DIR}/modelS.pdf",
 }
 
-# 200K 토큰 컨텍스트 창 안전 한계
-# 영문 기준 ~4자/토큰 → 720,000자 ≈ 180K 토큰 (20K는 시스템+질문+답변 여유)
-MAX_MANUAL_CHARS = 720_000
+# 실측치: 720,000자 → 476,908 토큰 (1.51자/토큰)
+# 목표: 150,000 토큰 이하 → 150,000 × 1.51 ≈ 226,500자
+# 여유분 포함하여 200,000자로 설정
+MAX_MANUAL_CHARS = 200_000
 
 SYSTEM_PROMPT = """당신은 테슬라 고객센터 상담원을 지원하는 AI 어시스턴트입니다.
 제공된 테슬라 오너스 매뉴얼을 참고하여 고객 문의에 정확히 답변하세요.
@@ -28,6 +30,20 @@ SYSTEM_PROMPT = """당신은 테슬라 고객센터 상담원을 지원하는 AI
 3. 기능 이름이 영문이면 한국어 설명과 함께 영문도 병기하세요.
 4. 매뉴얼에 해당 정보가 정말 없는 경우에만 "이 매뉴얼에서 관련 정보를 찾을 수 없습니다"라고 안내하세요.
 5. 답변은 상담원이 고객에게 바로 전달할 수 있는 자연스러운 한국어로 작성하세요."""
+
+# ─── 텍스트 정리 ──────────────────────────────────────────────
+
+
+def clean_pdf_text(text: str) -> str:
+    """PDF 추출 텍스트 정리: 과도한 공백/줄바꿈 제거로 토큰 수 절약"""
+    text = text.replace("\t", " ")
+    text = re.sub(r" {2,}", " ", text)  # 연속 공백 → 단일 공백
+    lines = [line.strip() for line in text.split("\n")]
+    lines = [l for l in lines if l]  # 빈 줄 제거
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)  # 3개 이상 줄바꿈 → 2개
+    return text.strip()
+
 
 # ─── 매뉴얼 로딩: 디스크 캐시 우선 ───────────────────────────
 
@@ -45,7 +61,7 @@ def load_manual(model_name: str):
     """
     로딩 순서:
       1순위: cache/*.pkl  (즉시, <0.1초)
-      2순위: PDF 파싱 후 .pkl 저장 (최초 1회만 느림)
+      2순위: PDF 파싱 후 정리 → .pkl 저장 (최초 1회만 느림)
     """
     cache_file = _cache_path(model_name)
 
@@ -55,7 +71,7 @@ def load_manual(model_name: str):
             with open(cache_file, "rb") as f:
                 return pickle.load(f)
         except Exception:
-            os.remove(cache_file)  # 손상된 캐시 삭제 후 재파싱
+            os.remove(cache_file)
 
     # 2순위: PDF 파싱
     pdf_path = MANUALS.get(model_name)
@@ -69,9 +85,9 @@ def load_manual(model_name: str):
             if text and text.strip():
                 pages.append(text)
 
-    text = "\n\n".join(pages)
+    raw_text = "\n\n".join(pages)
+    text = clean_pdf_text(raw_text)  # 텍스트 정리로 토큰 수 절약
 
-    # 다음 시작을 위해 캐시 저장
     with open(cache_file, "wb") as f:
         pickle.dump(text, f)
 
@@ -96,7 +112,7 @@ def stream_answer(question: str, model_name: str, manual_text: str):
 
     client = anthropic.Anthropic(api_key=api_key)
 
-    # 컨텍스트 창 초과 방지
+    # 컨텍스트 창 초과 방지 (실측 기준 200,000자 ≈ 132,000 토큰)
     if len(manual_text) > MAX_MANUAL_CHARS:
         manual_text = manual_text[:MAX_MANUAL_CHARS]
         truncated = True
@@ -120,11 +136,11 @@ def stream_answer(question: str, model_name: str, manual_text: str):
             messages=[{"role": "user", "content": question}],
         ) as stream:
             if truncated:
-                yield "⚠️*매뉴얼이 커서 앞부분(약 180K 토큰)만 참조합니다.*\n\n"
+                yield "⚠️*매뉴얼이 커서 앞부분(약 132K 토큰)만 참조합니다.*\n\n"
             for text in stream.text_stream:
                 yield text
     except anthropic.BadRequestError as e:
-        yield f"❌ API 요청 오류입니다. 잠시 후 다시 시도해주세요.\n\n`{e.message}`"
+        yield f"❌ 요청 오류: {e.message}"
     except Exception as e:
         yield f"❌ 오류: {str(e)}"
 
@@ -154,7 +170,8 @@ with st.sidebar:
 
     st.divider()
 
-    if st.button("🗑️캐시 초기화", help="PDF 파일을 교체했을 때 클릭"):
+    # 캐시 초기화 (MAX_MANUAL_CHARS 변경 후 반드시 클릭)
+    if st.button("🗑️캐시 초기화", help="PDF 교체 또는 설정 변경 후 클릭"):
         for name in MANUALS:
             p = _cache_path(name)
             if os.path.exists(p):
@@ -165,7 +182,6 @@ with st.sidebar:
 
 # ─── 메인 영역 ────────────────────────────────────────────────
 
-# 최초 로딩 안내 (캐시 없을 때만 표시)
 if not cache_exists(model_choice):
     st.info(
         f"⏳ **{model_choice} 매뉴얼을 처음 로딩합니다.**  \n"
@@ -180,11 +196,15 @@ if not current_manual:
     st.info("modelX.pdf, modelS.pdf 파일이 app.py와 같은 폴더에 있는지 확인하세요.")
     st.stop()
 
-# 로딩된 매뉴얼 크기 표시
 chars = len(current_manual)
-approx_tokens = chars // 4
+actual_chars_used = min(chars, MAX_MANUAL_CHARS)
+est_tokens = int(actual_chars_used / 1.51)  # 실측 비율 적용
+
 if chars > MAX_MANUAL_CHARS:
-    st.warning(f"⚠️매뉴얼이 큽니다 (~{approx_tokens:,} 토큰). 앞부분 180K 토큰만 참조합니다.")
+    st.warning(
+        f"⚠️매뉴얼이 큽니다 ({chars:,}자). "
+        f"앞부분 {MAX_MANUAL_CHARS:,}자만 사용합니다 (약 {est_tokens:,} 토큰)."
+    )
 
 # ─── 검색 ────────────────────────────────────────────────────
 
