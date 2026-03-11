@@ -73,20 +73,49 @@ def load_index(model_name):
     with open(index_path, "rb") as f:
         return pickle.load(f)
 
+def expand_query(question: str) -> list[str]:
+    """한국어 질문을 영어 키워드로 확장합니다."""
+    client = anthropic.Anthropic()
+    resp = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=150,
+        messages=[
+            {
+                "role": "user",
+                "content": f"""테슬라 차량 매뉴얼에서 아래 질문과 관련된 내용을 찾을 영어 키워드 5개를 생성하세요.
+키워드만 쉼표로 구분해서 출력하세요. 설명 없이 키워드만.
+질문: {question}
+영어 키워드:""",
+            }
+        ],
+    )
+    raw = resp.content[0].text.strip()
+    keywords = [k.strip() for k in raw.split(",") if k.strip()]
+    return [question] + keywords
+
 
 def search(question, model_name, top_k=5):
     data = load_index(model_name)
-    scores = data["bm25"].get_scores(tokenize(question))
-    top_i = scores.argsort()[::-1][:top_k]
-    chunks = [
-        {
-            "text": data["chunks"][i]["text"],
-            "page": data["chunks"][i]["page"],
-            "score": round(float(scores[i]), 2),
-        }
-        for i in top_i
-        if scores[i] > 0
-    ]
+    # 쿼리 확장 (한국어 + 영어 키워드)
+    queries = expand_query(question)
+    seen_pages = set()
+    all_chunks = []
+    for query in queries:
+        scores = data["bm25"].get_scores(tokenize(query))
+        top_i = scores.argsort()[::-1][:3]
+        for i in top_i:
+            page = data["chunks"][i]["page"]
+            if scores[i] > 0 and page not in seen_pages:
+                seen_pages.add(page)
+                all_chunks.append(
+                    {
+                        "text": data["chunks"][i]["text"],
+                        "page": page,
+                        "score": round(float(scores[i]), 2),
+                    }
+                )
+    all_chunks.sort(key=lambda x: x["score"], reverse=True)
+    chunks = all_chunks[:top_k]
     context = "\n\n".join(
         f"[페이지 {c['page']} | 점수 {c['score']}]\n{c['text']}" for c in chunks
     )
