@@ -10,7 +10,7 @@ import anthropic
 from rank_bm25 import BM25Okapi
 import streamlit as st
 
-DATA_DIR = "data"
+DATA_DIR = ""
 DB_DIR   = "bm25_index"
 os.makedirs(DB_DIR, exist_ok=True)
 
